@@ -68,7 +68,7 @@ static int cmd_erase(const char *mountpoint)
 		return 1;
 	}
 	close(fd);
-	puts("superblocks were erased");
+	puts("filesystem was erased");
 	return 0;
 }
 

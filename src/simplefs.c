@@ -84,6 +84,55 @@ static bool simplefs_super_valid(const struct simplefs_disk_super *ds)
 	return le32_to_cpu(ds->checksum) == simplefs_super_crc(ds);
 }
 
+static bool simplefs_super_empty(const struct simplefs_disk_super *ds)
+{
+	const u8 *data = (const u8 *)ds;
+	size_t i;
+
+	for (i = 0; i < sizeof(*ds); i++) {
+		if (data[i])
+			return false;
+	}
+	return true;
+}
+
+static int simplefs_super_to_info(struct super_block *sb,
+				  const struct simplefs_disk_super *ds,
+				  struct simplefs_info *info)
+{
+	u64 total_sectors = le64_to_cpu(ds->total_sectors);
+	u64 disk_sb1 = le64_to_cpu(ds->sb1_sector);
+	u64 disk_sb2 = le64_to_cpu(ds->sb2_sector);
+	u32 name_len = le32_to_cpu(ds->max_name_len);
+	u32 file_sectors = le32_to_cpu(ds->file_sectors);
+	u64 file_count = le64_to_cpu(ds->file_count);
+	u64 usable;
+
+	if (total_sectors != bdev_nr_sectors(sb->s_bdev))
+		return -EINVAL;
+	if (disk_sb1 != sb1_sector || disk_sb2 != sb2_sector)
+		return -EINVAL;
+	if (disk_sb1 >= total_sectors || disk_sb2 >= total_sectors ||
+	    disk_sb1 == disk_sb2)
+		return -EINVAL;
+	if (name_len < 5 || name_len >= SIMPLEFS_MAX_IOCTL_NAME)
+		return -EINVAL;
+	if (!file_sectors)
+		return -EINVAL;
+
+	usable = total_sectors - 2;
+	if (file_count > div_u64(usable, file_sectors))
+		return -EINVAL;
+
+	info->total_sectors = total_sectors;
+	info->sb1_sector = disk_sb1;
+	info->sb2_sector = disk_sb2;
+	info->name_len = name_len;
+	info->file_sectors = file_sectors;
+	info->file_count = file_count;
+	return 0;
+}
+
 static void simplefs_super_build(struct simplefs_disk_super *ds,
 				 const struct simplefs_info *info)
 {
@@ -373,6 +422,29 @@ static int simplefs_zero_all(struct super_block *sb)
 	return 0;
 }
 
+static int simplefs_erase(struct super_block *sb)
+{
+	struct simplefs_info *info = sb->s_fs_info;
+	char zero[SIMPLEFS_SECTOR_SIZE] = { 0 };
+	int ret;
+
+	ret = simplefs_zero_all(sb);
+	if (ret)
+		return ret;
+
+	ret = simplefs_write_sector(sb, info->sb1_sector, zero, sizeof(zero));
+	if (ret)
+		return ret;
+	ret = simplefs_write_sector(sb, info->sb2_sector, zero, sizeof(zero));
+	if (ret)
+		return ret;
+
+	info->file_count = 0;
+	shrink_dcache_sb(sb);
+	invalidate_inodes(sb);
+	return 0;
+}
+
 static u32 simplefs_hash_file(struct super_block *sb, u64 index)
 {
 	struct simplefs_info *info = sb->s_fs_info;
@@ -401,15 +473,8 @@ static long simplefs_ioctl(struct file *file, unsigned int cmd,
 	switch (cmd) {
 	case SIMPLEFS_IOCTL_ZERO_ALL:
 		return simplefs_zero_all(sb);
-	case SIMPLEFS_IOCTL_ERASE_FS: {
-		char zero[SIMPLEFS_SECTOR_SIZE] = { 0 };
-		int ret;
-
-		ret = simplefs_write_sector(sb, info->sb1_sector, zero, sizeof(zero));
-		if (ret)
-			return ret;
-		return simplefs_write_sector(sb, info->sb2_sector, zero, sizeof(zero));
-	}
+	case SIMPLEFS_IOCTL_ERASE_FS:
+		return simplefs_erase(sb);
 	case SIMPLEFS_IOCTL_GET_META: {
 		struct simplefs_meta_arg meta;
 		u64 i;
@@ -524,20 +589,14 @@ static int simplefs_load_or_format(struct super_block *sb,
 	first_ok = simplefs_super_valid(&first);
 	second_ok = simplefs_super_valid(&second);
 
-	if (first_ok || second_ok) {
-		struct simplefs_disk_super *src = first_ok ? &first : &second;
-
-		info->total_sectors = le64_to_cpu(src->total_sectors);
-		info->sb1_sector = le64_to_cpu(src->sb1_sector);
-		info->sb2_sector = le64_to_cpu(src->sb2_sector);
-		info->name_len = le32_to_cpu(src->max_name_len);
-		info->file_sectors = le32_to_cpu(src->file_sectors);
-		info->file_count = le64_to_cpu(src->file_count);
-
-		if (!first_ok || !second_ok)
-			return simplefs_write_disk_super(sb, info);
-		return 0;
+	if (first_ok && second_ok) {
+		if (memcmp(&first, &second, sizeof(first)) != 0)
+			return -EINVAL;
+		return simplefs_super_to_info(sb, &first, info);
 	}
+
+	if (!simplefs_super_empty(&first) || !simplefs_super_empty(&second))
+		return -EINVAL;
 
 	usable = info->total_sectors - 2;
 	info->file_count = div_u64(usable, info->file_sectors);
